@@ -1,5 +1,6 @@
 import { Bot, User } from "lucide-react"
 import type { ChatMessage } from "@/context/app-context"
+import { DiagnoseTrace } from "@/components/diagnose-trace"
 import {
   Table,
   TableBody,
@@ -31,9 +32,8 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
     <div className={`flex gap-3 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
       {/* Avatar */}
       <div
-        className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${
-          isUser ? "bg-secondary" : "bg-primary"
-        }`}
+        className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${isUser ? "bg-secondary" : "bg-primary"
+          }`}
       >
         {isUser ? (
           <User className="h-4 w-4 text-secondary-foreground" />
@@ -44,22 +44,27 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
 
       {/* Message Content */}
       <div
-        className={`max-w-[75%] rounded-xl px-4 py-3 ${
-          isUser
+        className={`${message.diagnoseResult ? "max-w-[90%]" : "max-w-[75%]"
+          } rounded-xl px-4 py-3 ${isUser
             ? "bg-secondary text-secondary-foreground"
             : "border border-border bg-card text-card-foreground"
-        }`}
+          }`}
       >
         {/* Detect if content looks like JSON / query result and use mono font */}
         <p
-          className={`text-sm leading-relaxed ${
-            !isUser && (message.content.startsWith("{") || message.content.startsWith("["))
+          className={`text-sm leading-relaxed ${!isUser && (message.content.startsWith("{") || message.content.startsWith("["))
               ? "font-mono text-xs"
               : ""
-          } whitespace-pre-wrap break-words`}
+            } whitespace-pre-wrap break-words`}
         >
           {message.content}
         </p>
+        {!isUser && message.diagnoseResult && (
+          <DiagnoseTrace
+            query={message.diagnoseResult.query}
+            steps={message.diagnoseResult.steps}
+          />
+        )}
         {!isUser && message.queryResult && (
           <div className="mt-3 space-y-2">
             {typeof message.queryResult.total_results === "number" && (

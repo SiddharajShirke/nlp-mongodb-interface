@@ -1,12 +1,14 @@
 "use client"
 
 import Link from "next/link"
-import { Table2, ArrowRight } from "lucide-react"
+import { Table2, ArrowRight, MessageSquare, Pencil } from "lucide-react"
 import { useAppContext } from "@/context/app-context"
 
 /**
  * CollectionList: Displays collections for the selected database.
- * Each collection links to the chat interface for querying.
+ * Each collection shows two action links:
+ *   - Query Chat  → /chat/:db/:col  (read-only NLP queries)
+ *   - Mongo Edit  → /edit/:db/:col  (CRUD mutations with approval)
  */
 export function CollectionList() {
   const { collections, selectedDB, selectedCollection, setSelectedCollection } =
@@ -49,17 +51,31 @@ export function CollectionList() {
       </div>
       <div className="grid gap-2">
         {collections.map((col) => (
-          <Link
+          <div
             key={col}
-            href={`/chat/${selectedDB}/${col}`}
             className="group flex items-center justify-between rounded-lg border border-border bg-card p-4 transition-colors hover:border-primary/40 hover:bg-card/80"
           >
             <div className="flex items-center gap-3">
               <Table2 className="h-4 w-4 text-primary" />
               <span className="font-mono text-sm text-card-foreground">{col}</span>
             </div>
-            <ArrowRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-          </Link>
+            <div className="flex items-center gap-2">
+              <Link
+                href={`/chat/${selectedDB}/${col}`}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-secondary px-3 py-1.5 text-xs font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+              >
+                <MessageSquare className="h-3.5 w-3.5" />
+                Query
+              </Link>
+              <Link
+                href={`/edit/${selectedDB}/${col}`}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+                Mongo Edit
+              </Link>
+            </div>
+          </div>
         ))}
       </div>
     </div>

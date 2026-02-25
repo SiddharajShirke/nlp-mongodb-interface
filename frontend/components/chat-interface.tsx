@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from "react"
 import { Send, Loader2, Sparkles, Search, Trash2 } from "lucide-react"
 import { useAppContext } from "@/context/app-context"
+import { useAuth } from "@/context/auth-context"
 import { MessageBubble } from "@/components/message-bubble"
 import { sendQuery, diagnoseQuery, clearCache } from "@/lib/api/gateway"
 
@@ -20,6 +21,7 @@ export function ChatInterface({
   collection: string
 }) {
   const { chatMessages, addChatMessage, connectionString } = useAppContext()
+  const { user } = useAuth()
   const [input, setInput] = useState("")
   const [isLoading, setIsLoading] = useState(false)
   const [isDiagnosing, setIsDiagnosing] = useState(false)
@@ -41,6 +43,12 @@ export function ChatInterface({
     const trimmed = input.trim()
     if (!trimmed || isLoading) return
 
+    // Build history from existing chat messages
+    const history = chatMessages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }))
+
     // Add user message
     addChatMessage({
       id: `msg-${Date.now()}`,
@@ -58,6 +66,8 @@ export function ChatInterface({
         db,
         collection,
         query: trimmed,
+        history,
+        userEmail: user?.email,
       })
       addChatMessage({
         id: `msg-${Date.now()}-res`,
@@ -123,6 +133,12 @@ export function ChatInterface({
     const trimmed = input.trim()
     if (!trimmed || isDiagnosing) return
 
+    // Build history from existing chat messages
+    const history = chatMessages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }))
+
     setIsDiagnosing(true)
     try {
       const result = await diagnoseQuery({
@@ -130,33 +146,29 @@ export function ChatInterface({
         db,
         collection,
         query: trimmed,
+        history,
+        userEmail: user?.email,
       })
 
       const steps = result.steps || {}
-      const parseStep = steps["2_parse"] as
-        | { parser_used?: string; raw_ir?: unknown; error?: string }
-        | undefined
-      const validateStep = steps["4_validate"] as
-        | { status?: string; error?: string }
-        | undefined
-      const executeStep = steps["6_execute_preview"] as
-        | { total_count?: number; error?: string }
-        | undefined
+      const parseStep = steps["2_parse"]
+      const executeStep = steps["6_execute_preview"]
 
-      const summaryLines = [
-        `Diagnosis for: ${trimmed}`,
-        parseStep?.parser_used ? `Parser: ${parseStep.parser_used}` : "Parser: unknown",
-        validateStep?.status ? `Validation: ${validateStep.status}` : "Validation: unknown",
-        typeof executeStep?.total_count === "number"
-          ? `Matched documents: ${executeStep.total_count}`
-          : "Matched documents: unknown",
-      ]
+      const summaryParts: string[] = [`Diagnosis for: "${trimmed}"`]
+      if (parseStep?.parser) summaryParts.push(`Parser: ${parseStep.parser}`)
+      if (parseStep?.raw_ir?.operation) summaryParts.push(`Operation: ${parseStep.raw_ir.operation}`)
+      if (typeof executeStep?.total_count === "number")
+        summaryParts.push(`Matched: ${executeStep.total_count} documents`)
 
       addChatMessage({
         id: `msg-${Date.now()}-diag`,
         role: "assistant",
-        content: `${summaryLines.join("\n")}\n\nTrace:\n${JSON.stringify(steps, null, 2)}`,
+        content: summaryParts.join(" | "),
         timestamp: new Date(),
+        diagnoseResult: {
+          query: trimmed,
+          steps,
+        },
       })
     } catch (err) {
       const message = err instanceof Error ? err.message : "Diagnosis failed"

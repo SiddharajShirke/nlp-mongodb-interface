@@ -97,6 +97,43 @@ def _case_insensitive_contains(value: Any) -> Any:
     return value
 
 
+def _build_id_filter(value: Any) -> Dict[str, Any]:
+    """Build a filter for ``_id`` that tries every plausible type.
+
+    MongoDB stores ``_id`` as string, int, or ObjectId depending on the
+    collection.  Rather than guessing, we produce an ``$or`` filter that
+    matches any of the candidate types so the query succeeds regardless of
+    the actual storage type.
+    """
+    candidates: list = []
+
+    # Always try value as-is (string)
+    str_val = str(value)
+    candidates.append({"_id": str_val})
+
+    # Try numeric conversion (e.g. "10009999" → 10009999)
+    try:
+        int_val = int(str_val)
+        candidates.append({"_id": int_val})
+    except (ValueError, TypeError):
+        pass
+
+    try:
+        float_val = float(str_val)
+        if float_val != int(float_val) if str_val.replace('.', '', 1).lstrip('-').isdigit() else False:
+            candidates.append({"_id": float_val})
+    except (ValueError, TypeError):
+        pass
+
+    # Try ObjectId (requires 24-hex-char string)
+    if _ObjectId is not None and isinstance(str_val, str) and _OBJECTID_RE.match(str_val):
+        candidates.append({"_id": _ObjectId(str_val)})
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return {"$or": candidates}
+
+
 def _build_eq_filter(
     field: str,
     value: Any,
@@ -107,14 +144,20 @@ def _build_eq_filter(
     Priority:
     1. If the value is a **list** → exact array match (user provided a
        JSON array literal like ``["Pearl White","Crane Wilbur"]``).
-    2. If ``field_types`` tells us the field is an array-of-strings →
+    2. If field is ``_id`` → use multi-type ``$or`` to handle string /
+       int / ObjectId storage transparently.
+    3. If ``field_types`` tells us the field is an array-of-strings →
        partial match (user writes "options is Order" and means *contains*).
-    3. Otherwise fall back to ``_case_insensitive_eq`` (anchored regex for
+    4. Otherwise fall back to ``_case_insensitive_eq`` (anchored regex for
        strings, exact match for numbers).
     """
     # Exact array match — user explicitly provided a list value
     if isinstance(value, list):
         return {field: value}
+
+    # Special handling for _id — try all plausible types
+    if field == "_id":
+        return _build_id_filter(value)
 
     ftype = (field_types or {}).get(field)
 

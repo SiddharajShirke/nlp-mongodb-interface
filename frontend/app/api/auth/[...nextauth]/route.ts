@@ -1,15 +1,6 @@
 import NextAuth from "next-auth"
 import GoogleProvider from "next-auth/providers/google"
 
-const googleClientId = process.env.GOOGLE_CLIENT_ID
-const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET
-
-if (!googleClientId || !googleClientSecret) {
-  throw new Error(
-    "Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET. Set them in frontend/.env.local."
-  )
-}
-
 const handler = NextAuth({
   debug: process.env.NODE_ENV !== "production",
   logger: {
@@ -20,10 +11,11 @@ const handler = NextAuth({
       console.warn("[NEXTAUTH][WARN]", code)
     },
   },
+  secret: process.env.NEXTAUTH_SECRET,
   providers: [
     GoogleProvider({
-      clientId: googleClientId,
-      clientSecret: googleClientSecret,
+      clientId: process.env.GOOGLE_CLIENT_ID ?? "",
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? "",
       authorization: {
         params: {
           prompt: "select_account",

@@ -10,6 +10,12 @@ const {
     handleDiagnoseSchema,
     handleClearCache,
     handleLLMStatus,
+    handleMutationEstimate,
+    handleMutationPreview,
+    handleMutationCommit,
+    handleCommitTimeline,
+    handleActivityStats,
+    handleDiagnosisMonthly,
 } = require("../controllers/nlqController");
 
 const router = express.Router();
@@ -24,5 +30,13 @@ router.post("/diagnose", handleDiagnose);
 router.post("/diagnose-schema", handleDiagnoseSchema);
 router.post("/clear-cache", handleClearCache);
 router.get("/llm-status", handleLLMStatus);
+router.post("/mutation-estimate", handleMutationEstimate);
+router.post("/mutation-preview", handleMutationPreview);
+router.post("/mutation-commit", handleMutationCommit);
+
+// Analytics / Dashboard
+router.post("/analytics/commit-timeline", handleCommitTimeline);
+router.post("/analytics/stats", handleActivityStats);
+router.post("/analytics/diagnosis-monthly", handleDiagnosisMonthly);
 
 module.exports = router;

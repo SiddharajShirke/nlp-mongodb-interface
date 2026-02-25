@@ -2,7 +2,8 @@
 
 import Link from "next/link"
 import { useAuth } from "@/context/auth-context"
-import { Database, LogOut } from "lucide-react"
+import { useAppContext } from "@/context/app-context"
+import { Database, LogOut, LayoutDashboard } from "lucide-react"
 
 /**
  * Navbar: Top navigation bar shown across all pages.
@@ -10,6 +11,7 @@ import { Database, LogOut } from "lucide-react"
  */
 export function Navbar() {
   const { user, isAuthenticated, isLoading, authError, authActionLoading, login, logout } = useAuth()
+  const { isConnected } = useAppContext()
 
   return (
     <header className="sticky top-0 z-50 flex items-center justify-between border-b border-border bg-background/80 px-6 py-3 backdrop-blur-md">
@@ -33,8 +35,17 @@ export function Navbar() {
               href="/connector"
               className="text-sm text-muted-foreground transition-colors hover:text-foreground"
             >
-              Dashboard
+              Connector
             </Link>
+            {isConnected && (
+              <Link
+                href="/dashboard"
+                className="flex items-center gap-1 text-sm text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <LayoutDashboard className="h-3.5 w-3.5" />
+                Dashboard
+              </Link>
+            )}
             <div className="flex items-center gap-3">
               <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-xs font-medium text-primary-foreground">
                 {user?.avatar}

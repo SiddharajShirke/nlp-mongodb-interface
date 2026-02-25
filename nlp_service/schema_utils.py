@@ -103,12 +103,10 @@ def flatten_document(doc: Dict[str, Any], parent_key: str = "", sep: str = ".") 
       used to discover nested paths (MongoDB natively supports dot-notation
       queries into arrays, e.g. ``options.type`` matches ``{options: [{type: "x"}]}``)
     - Arrays of primitives are treated as terminal fields.
-    - ``_id`` is excluded.
+    - ``_id`` is included so users can query and reference documents by id.
     """
     items: Dict[str, Any] = {}
     for key, value in doc.items():
-        if key == "_id" and parent_key == "":
-            continue
         new_key = f"{parent_key}{sep}{key}" if parent_key else key
         if isinstance(value, dict):
             items.update(flatten_document(value, new_key, sep))
@@ -221,8 +219,6 @@ def _detect_field_types_recursive(
     though ``flatten_document`` doesn't keep the parent key.
     """
     for key, value in doc.items():
-        if key == "_id" and parent_key == "":
-            continue
         full_key = f"{parent_key}{sep}{key}" if parent_key else key
         ftype = _detect_type(value)
         existing = field_types.get(full_key)

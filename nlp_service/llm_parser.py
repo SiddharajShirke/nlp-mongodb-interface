@@ -1,17 +1,21 @@
 """
-LLM-based natural language query parser using Google Gemini.
+LLM-based natural language query parser using Groq or Google Gemini.
 
 This module provides an AI-powered parser that understands ANY natural language
 query pattern — including complex nested queries, array literals, sub-queries,
 and colloquial human language — by leveraging a large language model.
 
 Architecture:
-    User Query + Schema  →  LLM Prompt  →  Gemini API  →  JSON IR
+    User Query + Schema  →  LLM Prompt  →  Groq/Gemini API  →  JSON IR
+
+Supported providers (set via LLM_PROVIDER env var):
+    - "groq"   (default) — fast inference via Groq Cloud (Llama 3.3 70B)
+    - "gemini" — Google Gemini API
 
 The LLM parser serves as the PRIMARY parser, with the rule-based ``parser.py``
 as an automatic fallback when:
     - No API key is configured
-    - The ``google-generativeai`` package is not installed
+    - The required SDK package is not installed
     - The LLM call fails (network, rate limits, etc.)
     - The LLM response cannot be parsed into valid IR
 
@@ -29,10 +33,34 @@ from typing import Any, Dict, List, Optional
 from logger import logger
 
 # ---------------------------------------------------------------------------
-# Lazy-load the Gemini SDK so the rest of the app works even when
-# google-genai is not installed.
+# Lazy-load LLM SDK clients so the rest of the app works even when the
+# provider SDK is not installed.
 # ---------------------------------------------------------------------------
 _genai_client = None
+_groq_client = None
+
+
+def _get_llm_provider() -> str:
+    """Return the configured LLM provider ('groq' or 'gemini')."""
+    return os.getenv("LLM_PROVIDER", "groq").strip().lower()
+
+
+def _get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        try:
+            from groq import Groq
+            api_key = os.getenv("GROQ_API_KEY", "").strip()
+            if not api_key:
+                return None
+            _groq_client = Groq(api_key=api_key)
+        except ImportError:
+            logger.warning(
+                "groq is not installed. "
+                "Run: pip install groq"
+            )
+            return None
+    return _groq_client
 
 
 def _get_genai_client():
@@ -330,11 +358,31 @@ def _build_prompt(
     allowed_fields: List[str],
     numeric_fields: List[str],
     field_types: Optional[Dict[str, str]],
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """Build the full prompt sent to the LLM."""
     schema_block = _build_schema_block(
         allowed_fields, numeric_fields, field_types,
     )
+
+    # Build conversation history block if provided
+    history_block = ""
+    if history and len(history) > 0:
+        # Limit to last 10 messages to keep prompt manageable
+        recent = history[-10:]
+        lines = []
+        for msg in recent:
+            role = msg.get("role", "user").upper()
+            content = msg.get("content", "")
+            # Truncate very long messages
+            if len(content) > 300:
+                content = content[:300] + "..."
+            lines.append(f"  {role}: {content}")
+        history_block = (
+            "\n\nCONVERSATION HISTORY (use for context when resolving "
+            "follow-up references like 'those', 'more of that', etc.):\n"
+            + "\n".join(lines)
+        )
 
     # Use double-braces {{ }} to escape literal JSON braces inside f-string
     return f"""You are a MongoDB natural language query parser.  Convert the
@@ -436,8 +484,147 @@ Query: "find products with price between 100 and 500"
 Now parse this query:
 
 USER QUERY: "{query}"
-
+{history_block}
 Important: Respond ONLY with the JSON object. No explanation, no markdown."""
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Provider-specific LLM call helpers
+# ---------------------------------------------------------------------------
+
+def _call_groq(prompt: str, models_to_try: List[str]):
+    """Call the Groq API. Returns (raw_text, model_name, elapsed) or Nones."""
+    client = _get_groq_client()
+    if client is None:
+        return None, None, 0.0
+
+    raw_text = None
+    elapsed = 0.0
+    model_name = models_to_try[0]
+
+    for current_model in models_to_try:
+        logger.info("[LLM-Groq] Trying model %s", current_model)
+        max_retries = 1
+        model_succeeded = False
+
+        for attempt in range(max_retries + 1):
+            start = time.time()
+            try:
+                response = client.chat.completions.create(
+                    model=current_model,
+                    messages=[
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=1024,
+                )
+                elapsed = time.time() - start
+                raw_text = response.choices[0].message.content
+                model_name = current_model
+                logger.info(
+                    "[LLM-Groq] %s responded in %.2fs (%d chars)",
+                    current_model, elapsed, len(raw_text),
+                )
+                logger.debug("[LLM-Groq] Raw response: %s", raw_text[:500])
+                model_succeeded = True
+                break
+            except Exception as e:
+                elapsed = time.time() - start
+                err_str = str(e)
+                is_retriable = "429" in err_str or "404" in err_str
+
+                if is_retriable:
+                    if "429" in err_str and attempt < max_retries:
+                        wait = min(5, 4 * (attempt + 1))
+                        logger.warning(
+                            "[LLM-Groq] %s rate-limited (attempt %d/%d), retrying in %ds...",
+                            current_model, attempt + 1, max_retries + 1, wait,
+                        )
+                        time.sleep(wait)
+                        continue
+                    else:
+                        reason = "rate-limited (429)" if "429" in err_str else "not available (404)"
+                        logger.warning("[LLM-Groq] %s %s, trying next model...",
+                                       current_model, reason)
+                        break
+                logger.error("[LLM-Groq] %s call failed after %.2fs: %s",
+                             current_model, elapsed, e)
+                return None, None, 0.0
+
+        if model_succeeded:
+            break
+
+    return raw_text, model_name, elapsed
+
+
+def _call_gemini(prompt: str, models_to_try: List[str]):
+    """Call the Google Gemini API. Returns (raw_text, model_name, elapsed) or Nones."""
+    client = _get_genai_client()
+    if client is None:
+        return None, None, 0.0
+
+    raw_text = None
+    elapsed = 0.0
+    model_name = models_to_try[0]
+
+    for current_model in models_to_try:
+        logger.info("[LLM-Gemini] Trying model %s", current_model)
+        max_retries = 1
+        model_succeeded = False
+
+        for attempt in range(max_retries + 1):
+            start = time.time()
+            try:
+                from google.genai import types
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=1024,
+                    ),
+                )
+                elapsed = time.time() - start
+                raw_text = response.text
+                model_name = current_model
+                logger.info(
+                    "[LLM-Gemini] %s responded in %.2fs (%d chars)",
+                    current_model, elapsed, len(raw_text),
+                )
+                logger.debug("[LLM-Gemini] Raw response: %s", raw_text[:500])
+                model_succeeded = True
+                break
+            except Exception as e:
+                elapsed = time.time() - start
+                err_str = str(e)
+                is_retriable = "429" in err_str or "404" in err_str or "NOT_FOUND" in err_str
+
+                if is_retriable:
+                    if "429" in err_str and attempt < max_retries:
+                        wait = min(5, 4 * (attempt + 1))
+                        logger.warning(
+                            "[LLM-Gemini] %s rate-limited (attempt %d/%d), retrying in %ds...",
+                            current_model, attempt + 1, max_retries + 1, wait,
+                        )
+                        time.sleep(wait)
+                        continue
+                    else:
+                        reason = "rate-limited (429)" if "429" in err_str else "not available (404)"
+                        logger.warning("[LLM-Gemini] %s %s, trying next model...",
+                                       current_model, reason)
+                        break
+                logger.error("[LLM-Gemini] %s call failed after %.2fs: %s",
+                             current_model, elapsed, e)
+                return None, None, 0.0
+
+        if model_succeeded:
+            break
+
+    return raw_text, model_name, elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -449,70 +636,54 @@ def parse_with_llm(
     allowed_fields: List[str],
     numeric_fields: List[str],
     field_types: Optional[Dict[str, str]] = None,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Parse a natural language query using Google Gemini.
+    """Parse a natural language query using the configured LLM provider.
+
+    Supports Groq (default) and Google Gemini, controlled via the
+    ``LLM_PROVIDER`` env var.
 
     Returns the same IR dict as ``parser.parse_to_ir()``, or ``None`` if:
-      - No API key is configured (``GEMINI_API_KEY`` env var)
-      - ``google-generativeai`` is not installed
+      - No API key is configured
+      - The required SDK is not installed
       - The LLM call fails
       - The response cannot be parsed into valid IR
 
     Callers should fall back to ``parser.parse_to_ir()`` when this returns
     ``None``.
     """
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        logger.debug("No GEMINI_API_KEY — skipping LLM parser")
-        return None
+    provider = _get_llm_provider()
 
-    client = _get_genai_client()
-    if client is None:
-        return None
+    prompt = _build_prompt(query, allowed_fields, numeric_fields, field_types, history)
 
-    # ---- Configure & call Gemini ----
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-
-    prompt = _build_prompt(query, allowed_fields, numeric_fields, field_types)
-
-    # Retry up to 2 times on transient 429 rate-limit errors
-    max_retries = 2
-    raw_text = None
-    elapsed = 0.0
-
-    for attempt in range(max_retries + 1):
-        start = time.time()
-        try:
-            from google.genai import types
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,       # fully deterministic, no hallucination
-                    max_output_tokens=1024,
-                ),
-            )
-            elapsed = time.time() - start
-            raw_text = response.text
-            logger.info(
-                "[LLM] Gemini responded in %.2fs (%d chars)",
-                elapsed, len(raw_text),
-            )
-            logger.debug("[LLM] Raw response: %s", raw_text[:500])
-            break  # success
-        except Exception as e:
-            elapsed = time.time() - start
-            err_str = str(e)
-            if "429" in err_str and attempt < max_retries:
-                wait = 4 * (attempt + 1)  # 4s, 8s backoff
-                logger.warning(
-                    "[LLM] Rate limited (attempt %d/%d), retrying in %ds...",
-                    attempt + 1, max_retries + 1, wait,
-                )
-                time.sleep(wait)
-                continue
-            logger.error("[LLM] Gemini call failed after %.2fs: %s", elapsed, e)
+    if provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            logger.debug("No GROQ_API_KEY — skipping LLM parser")
             return None
+        primary_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        _FALLBACK_MODELS = [
+            primary_model,
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+        ]
+        models_to_try = list(dict.fromkeys(_FALLBACK_MODELS))
+        raw_text, model_name, elapsed = _call_groq(prompt, models_to_try)
+    else:
+        # Gemini
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            logger.debug("No GEMINI_API_KEY — skipping LLM parser")
+            return None
+        primary_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
+        _FALLBACK_MODELS = [
+            primary_model,
+            "gemini-2.0-flash-lite",
+            "gemini-2.0-flash",
+        ]
+        models_to_try = list(dict.fromkeys(_FALLBACK_MODELS))
+        raw_text, model_name, elapsed = _call_gemini(prompt, models_to_try)
 
     if raw_text is None:
         return None

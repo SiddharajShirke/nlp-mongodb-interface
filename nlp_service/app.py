@@ -35,7 +35,16 @@ from schema_utils import (
     clear_schema_cache,
     invalidate_schema,
 )
-from response_formatter import format_response
+from response_formatter import format_response, _sanitise_value
+from activity_tracker import (
+    log_activity,
+    get_commit_timeline,
+    get_activity_stats,
+    get_diagnosis_monthly,
+    ACTIVITY_QUERY,
+    ACTIVITY_DIAGNOSE,
+    ACTIVITY_COMMIT,
+)
 from logger import logger
 
 
@@ -76,12 +85,50 @@ class NLPRequest(BaseModel):
         le=MAX_PAGE_SIZE,
         description=f"Results per page (max {MAX_PAGE_SIZE})",
     )
+    history: Optional[List[Dict[str, str]]] = Field(
+        default=None,
+        description="Conversation history as [{role, content}, ...]",
+    )
+    user_email: Optional[str] = Field(
+        default="anonymous",
+        description="Email of the logged-in user (for activity tracking)",
+    )
 
 
 class SchemaRequest(BaseModel):
     mongo_uri: str
     database_name: str
     collection_name: str
+
+
+class MutationRequest(BaseModel):
+    """Request model for CRUD mutation operations (insert/update/delete)."""
+    mongo_uri: str
+    database_name: str
+    collection_name: str
+    query: str
+    history: Optional[List[Dict[str, str]]] = Field(
+        default=None,
+        description="Conversation history as [{role, content}, ...]",
+    )
+    user_email: Optional[str] = Field(
+        default="anonymous",
+        description="Email of the logged-in user (for activity tracking)",
+    )
+
+
+class CommitRequest(BaseModel):
+    """Request model for committing a previewed mutation."""
+    mongo_uri: str
+    database_name: str
+    collection_name: str
+    mutation: Dict[str, Any] = Field(
+        description="The mutation plan returned by /mutation-preview",
+    )
+    user_email: Optional[str] = Field(
+        default="anonymous",
+        description="Email of the logged-in user (for activity tracking)",
+    )
 
 
 # ---------------------- ENDPOINTS ----------------------
@@ -182,6 +229,7 @@ def run_nlp(request: NLPRequest):
         try:
             ir = parse_with_llm(
                 request.query, allowed_fields, numeric_fields, field_types,
+                history=request.history,
             )
             if ir:
                 parser_used = "llm"
@@ -328,6 +376,23 @@ def run_nlp(request: NLPRequest):
         )
         logger.info("[PIPELINE] Step 8 — Index warning (non-blocking): %s", index_warning)
 
+    # 9. Log activity (fire-and-forget)
+    try:
+        log_activity(
+            request.mongo_uri, request.database_name,
+            activity_type=ACTIVITY_QUERY,
+            collection_name=request.collection_name,
+            user_email=getattr(request, "user_email", "anonymous") or "anonymous",
+            query=request.query,
+            details={
+                "parser": parser_used,
+                "total_results": query_result.get("total_count", 0),
+                "operation": validated_ir.get("operation"),
+            },
+        )
+    except Exception:
+        pass
+
     return response
 
 
@@ -422,7 +487,8 @@ def diagnose_schema(request: NLPRequest):
     raw_doc_preview = None
     flat_preview = None
     if sample_doc:
-        sample_doc.pop("_id", None)
+        if "_id" in sample_doc:
+            sample_doc["_id"] = str(sample_doc["_id"])
         raw_doc_preview = {k: str(type(v).__name__) + ": " + repr(v)[:200] for k, v in sample_doc.items()}
         flat = flatten_document(sample_doc)
         flat_preview = {k: str(type(v).__name__) for k, v in flat.items()}
@@ -469,7 +535,8 @@ def diagnose(request: NLPRequest):
             _total_docs = _coll.count_documents({})
             _sample = _coll.find_one()
             if _sample:
-                _sample.pop("_id", None)
+                if "_id" in _sample:
+                    _sample["_id"] = str(_sample["_id"])
                 # Show type + truncated value for each field
                 _raw_fields: Dict[str, Any] = {}
                 for k, v in _sample.items():
@@ -520,6 +587,7 @@ def diagnose(request: NLPRequest):
             ir = parse_with_llm(
                 request.query, allowed_fields, numeric_fields,
                 trace["steps"]["1_schema"].get("field_types"),
+                history=request.history,
             )
             if ir:
                 parser_used = "llm"
@@ -630,7 +698,900 @@ def diagnose(request: NLPRequest):
     except Exception as e:
         trace["steps"]["7_index_info"] = {"error": str(e)}
 
-    return trace
+    # Sanitise the entire trace so BSON types (Decimal128, datetime,
+    # ObjectId, bytes, etc.) are JSON-serialisable.
+    sanitised = _sanitise_value(trace)
+
+    # Log diagnosis activity (fire-and-forget)
+    try:
+        exec_step = trace.get("steps", {}).get("6_execute_preview", {})
+        severity = "ok"
+        for step_key in ("1_schema", "2_parse", "4_validate", "6_execute_preview"):
+            st = trace.get("steps", {}).get(step_key, {})
+            if isinstance(st, dict) and st.get("status") == "error":
+                severity = "error"
+                break
+            if isinstance(st, dict) and st.get("error"):
+                severity = "warning"
+        log_activity(
+            request.mongo_uri, request.database_name,
+            activity_type=ACTIVITY_DIAGNOSE,
+            collection_name=request.collection_name,
+            user_email=getattr(request, "user_email", "anonymous") or "anonymous",
+            query=request.query,
+            details={
+                "severity": severity,
+                "total_results": exec_step.get("total_count", 0) if isinstance(exec_step, dict) else 0,
+                "parser": trace.get("steps", {}).get("2_parse", {}).get("parser", "unknown"),
+            },
+        )
+    except Exception:
+        pass
+
+    return sanitised
+
+
+# ====================== MONGO EDIT — CRUD MUTATIONS ======================
+
+
+def _build_mutation_prompt(
+    query: str,
+    allowed_fields: List[str],
+    numeric_fields: List[str],
+    field_types: Optional[Dict[str, str]],
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Build a dynamic, schema-aware prompt for LLM mutation planning.
+
+    The prompt is constructed entirely from the REAL collection schema — no
+    hard-coded field names or collection-specific examples.  This makes it
+    work for ANY MongoDB database/collection the user connects to.
+    """
+    from llm_parser import _build_schema_block
+
+    schema_block = _build_schema_block(allowed_fields, numeric_fields, field_types)
+
+    # Build a concise list of existing field names for the LLM to reference
+    field_list = ", ".join(allowed_fields[:60])  # cap to keep prompt short
+
+    # Pick a sample field + _id for inline guidance (if available)
+    sample_field = next(
+        (f for f in allowed_fields if f not in ("_id",)), "status"
+    )
+
+    history_block = ""
+    if history and len(history) > 0:
+        recent = history[-10:]
+        lines = []
+        for msg in recent:
+            role = msg.get("role", "user").upper()
+            content = msg.get("content", "")
+            if len(content) > 300:
+                content = content[:300] + "..."
+            lines.append(f"  {role}: {content}")
+        history_block = (
+            "\n\nCONVERSATION HISTORY:\n" + "\n".join(lines)
+        )
+
+    return f"""You are a MongoDB mutation planner.  Given a user's natural-language
+request and the collection schema, output a single JSON object representing
+the MongoDB operation to perform.
+
+DATABASE SCHEMA (field → type):
+{schema_block}
+
+Existing fields: [{field_list}]
+
+OUTPUT FORMAT — respond with ONLY a raw JSON object (no markdown fences, no
+explanation, no extra text):
+{{
+  "operation": "insert" | "update" | "delete",
+  "description": "<one-line human-readable summary>",
+  "filter": {{ ... }} | null,
+  "update": {{ "$set"|"$unset"|"$inc"|"$push"|... : {{ ... }} }} | null,
+  "document": {{ ... }} | null,
+  "documents": [ {{ ... }} ] | null,
+  "multi": true | false,
+  "estimated_affected": null
+}}
+
+RULES (apply dynamically to ANY collection):
+1. INSERT: set "document" (or "documents" for bulk). filter/update = null.
+2. UPDATE: set "filter" + "update". ALWAYS wrap values in a MongoDB update
+   operator ($set, $unset, $inc, $push, $pull, $rename, etc.).
+   NEVER put bare field:value directly in "update".
+3. DELETE: set "filter". document/update = null.
+4. For EXISTING fields, match the schema name exactly (case-sensitive, dot-notation).
+   For NEW fields the user wants to add, use the name they specify.
+5. Distinguish intent carefully:
+   • "add/set/change field X on document Y" → UPDATE with $set
+   • "remove/drop field X from document Y" → UPDATE with $unset
+   • "add/create/insert a new document/record/entry" → INSERT
+   • "delete/remove document/record/row matching …" → DELETE
+   • "increase/decrement field X by N" → UPDATE with $inc
+6. _id handling: always pass the _id value the user gives as a STRING.
+   Example: {{"_id": "10009999"}} — never cast to int or ObjectId yourself.
+7. "multi" = true ONLY when the user says "all", "every", "many", "bulk",
+   or the filter clearly matches multiple documents.  Default false.
+8. "estimated_affected" should always be null (the server calculates it).
+9. Values: keep number literals as numbers, strings as strings, booleans as
+   booleans.  Infer type from context (e.g. "price 100" → 100 as number).
+10. "description" must clearly state what will happen.
+
+USER QUERY: "{query}"
+{history_block}
+Respond with ONLY the JSON object."""
+
+
+def _call_mutation_groq(
+    prompt: str,
+    models_to_try: List[str],
+) -> Optional[str]:
+    """Call Groq API for mutation parsing. Returns raw text or None."""
+    import time as _time
+    from llm_parser import _get_groq_client
+
+    client = _get_groq_client()
+    if client is None:
+        raise RuntimeError(
+            "Could not initialise the Groq AI client. Ensure the "
+            "groq SDK is installed (pip install groq) and "
+            "your GROQ_API_KEY is valid."
+        )
+
+    raw_text = None
+    for model_name in models_to_try:
+        logger.info("[MUTATION-LLM] Trying Groq model %s", model_name)
+        max_retries = 1
+        model_succeeded = False
+
+        for attempt in range(max_retries + 1):
+            start = _time.time()
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=2048,
+                )
+                elapsed = _time.time() - start
+                raw_text = response.choices[0].message.content
+                logger.info("[MUTATION-LLM] Groq %s responded in %.2fs (%d chars)",
+                            model_name, elapsed, len(raw_text))
+                model_succeeded = True
+                break
+            except Exception as e:
+                elapsed = _time.time() - start
+                err_str = str(e)
+                is_retriable = "429" in err_str or "404" in err_str
+                if is_retriable:
+                    if "429" in err_str and attempt < max_retries:
+                        wait = min(5, 4 * (attempt + 1))
+                        logger.warning("[MUTATION-LLM] Groq %s rate-limited, retrying in %ds...",
+                                       model_name, wait)
+                        _time.sleep(wait)
+                        continue
+                    else:
+                        reason = "rate-limited (429)" if "429" in err_str else "not available (404)"
+                        logger.warning("[MUTATION-LLM] Groq %s %s, trying next model...",
+                                       model_name, reason)
+                        break
+                else:
+                    logger.error("[MUTATION-LLM] Groq %s failed after %.2fs: %s",
+                                 model_name, elapsed, e)
+                    raise RuntimeError(
+                        f"LLM call failed (Groq {model_name}): {err_str}. "
+                        "Check your API key and network."
+                    )
+        if model_succeeded:
+            break
+    return raw_text
+
+
+def _call_mutation_gemini(
+    prompt: str,
+    models_to_try: List[str],
+) -> Optional[str]:
+    """Call Gemini API for mutation parsing. Returns raw text or None."""
+    import re as _re
+    import time as _time
+    from llm_parser import _get_genai_client
+
+    client = _get_genai_client()
+    if client is None:
+        raise RuntimeError(
+            "Could not initialise the Gemini AI client. Ensure the "
+            "google-genai SDK is installed (pip install google-genai) and "
+            "your GEMINI_API_KEY is valid."
+        )
+
+    raw_text = None
+    for model_name in models_to_try:
+        logger.info("[MUTATION-LLM] Trying Gemini model %s", model_name)
+        max_retries = 1
+        model_succeeded = False
+
+        for attempt in range(max_retries + 1):
+            start = _time.time()
+            try:
+                from google.genai import types
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=2048,
+                    ),
+                )
+                elapsed = _time.time() - start
+                raw_text = response.text
+                logger.info("[MUTATION-LLM] Gemini %s responded in %.2fs (%d chars)",
+                            model_name, elapsed, len(raw_text))
+                model_succeeded = True
+                break
+            except Exception as e:
+                elapsed = _time.time() - start
+                err_str = str(e)
+                is_retriable = "429" in err_str or "404" in err_str or "NOT_FOUND" in err_str
+                if is_retriable:
+                    if "429" in err_str and attempt < max_retries:
+                        delay_match = _re.search(r"retry(?:Delay)?[^\d]*(\d+)", err_str, _re.IGNORECASE)
+                        suggested_delay = int(delay_match.group(1)) if delay_match else 5
+                        wait = min(suggested_delay, 8)
+                        logger.warning("[MUTATION-LLM] Gemini %s rate-limited, retrying in %ds...",
+                                       model_name, wait)
+                        _time.sleep(wait)
+                        continue
+                    else:
+                        reason = "rate-limited (429)" if "429" in err_str else "not available (404)"
+                        logger.warning("[MUTATION-LLM] Gemini %s %s, trying next model...",
+                                       model_name, reason)
+                        break
+                else:
+                    logger.error("[MUTATION-LLM] Gemini %s failed after %.2fs: %s",
+                                 model_name, elapsed, e)
+                    raise RuntimeError(
+                        f"LLM call failed (Gemini {model_name}): {err_str}. "
+                        "Check your API key and network."
+                    )
+        if model_succeeded:
+            break
+    return raw_text
+
+
+def _parse_mutation_with_llm(
+    query: str,
+    allowed_fields: List[str],
+    numeric_fields: List[str],
+    field_types: Optional[Dict[str, str]] = None,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Use LLM to parse a natural-language CRUD request into a mutation plan.
+
+    Returns the mutation dict on success.
+    Raises ``RuntimeError`` with a descriptive message on failure so the
+    caller can propagate a helpful detail to the frontend.
+
+    Supports Groq (default) and Gemini providers via LLM_PROVIDER env var.
+    Model fallback chain: if the primary model is rate-limited (429), the
+    function automatically tries alternative models before giving up.
+    """
+    import os, re as _re
+    from llm_parser import _get_llm_provider
+
+    provider = _get_llm_provider()
+    prompt = _build_mutation_prompt(query, allowed_fields, numeric_fields, field_types, history)
+
+    if provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "LLM is not configured — GROQ_API_KEY environment variable is "
+                "missing. Set it in your .env file or system environment."
+            )
+        primary_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        models_to_try = list(dict.fromkeys([
+            primary_model,
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+        ]))
+        raw_text = _call_mutation_groq(prompt, models_to_try)
+    else:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "LLM is not configured — GEMINI_API_KEY environment variable is "
+                "missing. Set it in your .env file or system environment."
+            )
+        primary_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
+        models_to_try = list(dict.fromkeys([
+            primary_model,
+            "gemini-2.0-flash-lite",
+            "gemini-2.0-flash",
+        ]))
+        raw_text = _call_mutation_gemini(prompt, models_to_try)
+
+    if raw_text is None:
+        provider_name = "Groq" if provider == "groq" else "Gemini"
+        raise RuntimeError(
+            f"All {provider_name} models are rate-limited (429 quota exceeded). "
+            "Options:\n"
+            "1. Wait ~1 minute and retry\n"
+            "2. Check your API key and quota at your provider's dashboard\n"
+            "3. Switch LLM_PROVIDER in .env to use a different provider"
+        )
+
+    # --- Robust JSON extraction ---
+    # Strip markdown code fences if present
+    cleaned = raw_text.strip()
+    cleaned = _re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = _re.sub(r"\s*```\s*$", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # Try to find a JSON object in the response
+    mutation = None
+    try:
+        mutation = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Try to extract the first { ... } block
+        brace_match = _re.search(r"\{[\s\S]*\}", cleaned)
+        if brace_match:
+            try:
+                mutation = json.loads(brace_match.group())
+            except json.JSONDecodeError:
+                pass
+
+    if mutation is None:
+        # Last resort: try the helper from llm_parser
+        from llm_parser import _extract_json
+        mutation = _extract_json(raw_text)
+
+    if mutation is None:
+        logger.warning("[MUTATION-LLM] Could not extract JSON from: %s", raw_text[:500])
+        raise RuntimeError(
+            "AI returned an unparseable response. Try rephrasing your query "
+            "more explicitly, e.g. 'add field X with value Y to document "
+            "with _id Z' or 'delete the document where _id is Z'."
+        )
+
+    # --- Auto-fix common LLM mistakes ---
+    op = mutation.get("operation", "").lower().strip()
+    # Normalise operation aliases
+    op_map = {
+        "create": "insert", "add": "insert", "new": "insert",
+        "put": "update", "set": "update", "modify": "update", "patch": "update",
+        "remove": "delete", "drop": "delete", "destroy": "delete",
+    }
+    op = op_map.get(op, op)
+    mutation["operation"] = op
+
+    if op not in ("insert", "update", "delete"):
+        logger.warning("[MUTATION-LLM] Invalid operation '%s' from LLM", op)
+        raise RuntimeError(
+            f"AI returned an unrecognised operation '{op}'. Rephrase your "
+            "query to clearly express an insert, update, or delete action."
+        )
+
+    # Fix: update with bare field:value instead of $set
+    if op == "update" and mutation.get("update"):
+        upd = mutation["update"]
+        has_operator = any(k.startswith("$") for k in upd)
+        if not has_operator:
+            # LLM forgot to wrap in $set — fix it automatically
+            mutation["update"] = {"$set": upd}
+            logger.info("[MUTATION-LLM] Auto-wrapped bare update in $set")
+
+    # Normalise optional keys so downstream code can rely on them
+    mutation.setdefault("filter", None)
+    mutation.setdefault("update", None)
+    mutation.setdefault("document", None)
+    mutation.setdefault("documents", None)
+    mutation.setdefault("multi", False)
+    mutation.setdefault("estimated_affected", None)
+    mutation.setdefault("description", f"{op} operation on the collection")
+
+    logger.info("[MUTATION-LLM] Parsed mutation: op=%s, desc=%s",
+                op, mutation.get("description", "")[:80])
+    return mutation
+
+
+def _coerce_id_value(raw_val: Any) -> List[Any]:
+    """Return a list of _id candidate values to try, most-specific first.
+
+    MongoDB collections use different _id types (string, int, ObjectId).
+    Rather than guessing, we generate candidates and let the caller probe
+    the collection to find which one actually matches a document.
+
+    Order: original value → int (if numeric string) → ObjectId (if 24-hex) → str.
+    Duplicates are removed while preserving order.
+    """
+    from bson import ObjectId as _OID
+
+    candidates: list = []
+    seen: set = set()
+
+    def _add(v: Any) -> None:
+        key = (type(v).__name__, str(v))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(v)
+
+    _add(raw_val)  # keep whatever the caller passed first
+
+    str_val = str(raw_val)
+
+    # Numeric string → int (many collections use numeric _id)
+    try:
+        int_val = int(str_val)
+        _add(int_val)
+    except (ValueError, TypeError):
+        pass
+
+    # 24-char hex → ObjectId
+    if len(str_val) == 24:
+        try:
+            _add(_OID(str_val))
+        except Exception:
+            pass
+
+    # Always try the plain string form too
+    _add(str_val)
+
+    return candidates
+
+
+def _resolve_filter_id(
+    collection: Any,
+    filt: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Given a filter that contains an _id key, probe the real collection
+    to find which _id type actually matches a document and return the
+    corrected filter.  If none match, return the original filter unchanged.
+    """
+    if "_id" not in filt:
+        return filt
+
+    candidates = _coerce_id_value(filt["_id"])
+    for candidate in candidates:
+        test_filt = {**filt, "_id": candidate}
+        try:
+            if collection.count_documents(test_filt, limit=1) > 0:
+                return test_filt
+        except Exception:
+            continue
+    # None matched — return with the first candidate (original)
+    return filt
+
+
+def _detect_collection_id_type(collection: Any) -> str:
+    """Sample existing documents to detect the dominant _id BSON type.
+
+    Returns one of: 'int', 'objectid', 'string', or 'unknown'.
+    """
+    from bson import ObjectId as _OID
+
+    sample = list(collection.find({}, {"_id": 1}).limit(20))
+    if not sample:
+        return "unknown"
+
+    type_counts: Dict[str, int] = {}
+    for doc in sample:
+        val = doc["_id"]
+        if isinstance(val, _OID):
+            t = "objectid"
+        elif isinstance(val, int):
+            t = "int"
+        elif isinstance(val, float):
+            t = "float"
+        else:
+            t = "string"
+        type_counts[t] = type_counts.get(t, 0) + 1
+
+    # Return the most common type
+    return max(type_counts, key=type_counts.get)  # type: ignore[arg-type]
+
+
+def _coerce_id_to_collection_type(raw_val: Any, collection: Any) -> Any:
+    """Coerce a raw _id value to match the dominant _id type in the collection.
+
+    This is critical for INSERT operations — the LLM always produces _id as a
+    JSON string, but the collection may use int or ObjectId _id values.
+    """
+    from bson import ObjectId as _OID
+
+    id_type = _detect_collection_id_type(collection)
+    str_val = str(raw_val)
+
+    if id_type == "int":
+        try:
+            return int(str_val)
+        except (ValueError, TypeError):
+            return raw_val
+    elif id_type == "float":
+        try:
+            return float(str_val)
+        except (ValueError, TypeError):
+            return raw_val
+    elif id_type == "objectid":
+        if isinstance(raw_val, _OID):
+            return raw_val
+        if len(str_val) == 24:
+            try:
+                return _OID(str_val)
+            except Exception:
+                return raw_val
+        # Not a valid ObjectId string — let MongoDB auto-generate
+        return raw_val
+    else:
+        # Default to string (or if unknown, keep original)
+        return str_val
+
+
+def _resolve_insert_ids(collection: Any, mutation: Dict[str, Any]) -> Dict[str, Any]:
+    """For insert operations, coerce _id values in document(s) to match the
+    collection's actual _id type and warn about duplicates.
+
+    Returns the mutation dict with coerced _id values and a
+    'duplicate_ids' list if any conflicts are detected.
+    """
+    duplicates: list = []
+
+    def _fix_doc(doc: dict) -> dict:
+        if "_id" not in doc:
+            return doc
+        coerced = _coerce_id_to_collection_type(doc["_id"], collection)
+        doc["_id"] = coerced
+        # Check for duplicate
+        try:
+            # Try all candidates to be thorough
+            candidates = _coerce_id_value(coerced)
+            for c in candidates:
+                if collection.count_documents({"_id": c}, limit=1) > 0:
+                    duplicates.append(str(c))
+                    break
+        except Exception:
+            pass
+        return doc
+
+    doc = mutation.get("document")
+    if doc and isinstance(doc, dict):
+        mutation["document"] = _fix_doc(doc)
+
+    docs = mutation.get("documents")
+    if docs and isinstance(docs, list):
+        mutation["documents"] = [_fix_doc(d) for d in docs if isinstance(d, dict)]
+
+    if duplicates:
+        mutation["duplicate_ids"] = duplicates
+
+    return mutation
+
+
+@app.post("/mutation-preview")
+def mutation_preview(request: MutationRequest):
+    """Parse a natural-language CRUD request and return a mutation plan
+    WITHOUT executing it.  The frontend shows this plan to the user
+    for approval before committing.
+
+    Pipeline:
+      1. Connect to MongoDB and retrieve / cache the collection schema
+      2. Send (query + schema) to LLM (Groq or Gemini)
+      3. Validate + normalise the LLM response into a MutationPlan
+      4. (For update/delete) Count affected documents + grab samples
+      5. Return the preview for human approval
+    """
+
+    logger.info("[MUTATION] Preview request: db=%s, coll=%s, query=%s",
+                request.database_name, request.collection_name, request.query[:120])
+
+    # ---- 1. Get schema ----
+    try:
+        allowed_fields, numeric_fields, field_types = get_cached_schema(
+            request.mongo_uri, request.database_name, request.collection_name,
+        )
+    except Exception as e:
+        logger.error("[MUTATION] Schema detection failed: %s", e)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Could not connect to MongoDB or detect the schema for "
+                f"'{request.database_name}.{request.collection_name}': {e}"
+            ),
+        )
+
+    logger.info("[MUTATION] Schema: %d fields (%d numeric)",
+                len(allowed_fields), len(numeric_fields))
+
+    # ---- 2 & 3. Parse mutation via LLM ----
+    try:
+        mutation = _parse_mutation_with_llm(
+            request.query, allowed_fields, numeric_fields, field_types,
+            history=request.history,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # ---- 4. Estimate affected documents for update/delete ----
+    if mutation["operation"] in ("update", "delete") and mutation.get("filter"):
+        try:
+            from pymongo import MongoClient
+            _client = MongoClient(request.mongo_uri, serverSelectionTimeoutMS=5000)
+            try:
+                _db = _client[request.database_name]
+                _coll = _db[request.collection_name]
+
+                filt = mutation["filter"]
+
+                # Dynamically resolve _id type (string/int/ObjectId)
+                if "_id" in filt:
+                    filt = _resolve_filter_id(_coll, filt)
+                    mutation["filter"] = filt
+
+                count = _coll.count_documents(filt)
+                mutation["estimated_affected"] = count
+
+                # Grab a few sample docs that would be affected
+                sample_cursor = _coll.find(filt).limit(3)
+                sample_docs = []
+                for doc in sample_cursor:
+                    doc["_id"] = str(doc["_id"])
+                    sample_docs.append(_sanitise_value(doc))
+                mutation["sample_affected"] = sample_docs
+            finally:
+                _client.close()
+        except Exception as e:
+            logger.warning("[MUTATION] Could not estimate affected docs: %s", e)
+            mutation["estimated_affected"] = None
+            mutation["sample_affected"] = []
+
+    # ---- 4b. For inserts: coerce _id type to match collection + check duplicates ----
+    if mutation["operation"] == "insert":
+        try:
+            from pymongo import MongoClient
+            _client = MongoClient(request.mongo_uri, serverSelectionTimeoutMS=5000)
+            try:
+                _db = _client[request.database_name]
+                _coll = _db[request.collection_name]
+                mutation = _resolve_insert_ids(_coll, mutation)
+                if mutation.get("duplicate_ids"):
+                    mutation["warning"] = (
+                        f"Document(s) with _id {mutation['duplicate_ids']} already "
+                        f"exist. Committing will fail with a duplicate key error."
+                    )
+                    logger.warning("[MUTATION] Duplicate _id detected: %s",
+                                   mutation["duplicate_ids"])
+            finally:
+                _client.close()
+        except Exception as e:
+            logger.warning("[MUTATION] Insert _id resolution failed: %s", e)
+
+    # ---- 5. Return preview ----
+    logger.info("[MUTATION] Preview ready: op=%s, affected=%s",
+                mutation["operation"], mutation.get("estimated_affected"))
+    return {
+        "status": "preview",
+        "query": request.query,
+        "mutation": _sanitise_value(mutation),
+    }
+
+
+class EstimateRequest(BaseModel):
+    """Request model for counting documents matching a filter (no LLM needed)."""
+    mongo_uri: str
+    database_name: str
+    collection_name: str
+    filter: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/mutation-estimate")
+def mutation_estimate(request: EstimateRequest):
+    """Count documents matching a filter and return samples.
+    Used by Manual mode to show an estimate WITHOUT invoking the LLM."""
+    from pymongo import MongoClient
+
+    logger.info("[MUTATION-ESTIMATE] Counting docs in %s.%s with filter %s",
+                request.database_name, request.collection_name,
+                json.dumps(request.filter)[:200])
+    try:
+        client = MongoClient(request.mongo_uri, serverSelectionTimeoutMS=5000)
+        try:
+            db = client[request.database_name]
+            coll = db[request.collection_name]
+            count = coll.count_documents(request.filter)
+            sample_cursor = coll.find(request.filter).limit(3)
+            sample_docs = []
+            for doc in sample_cursor:
+                doc["_id"] = str(doc["_id"])
+                sample_docs.append(_sanitise_value(doc))
+        finally:
+            client.close()
+    except Exception as e:
+        logger.warning("[MUTATION-ESTIMATE] Failed: %s", e)
+        return {"count": None, "sample_affected": [], "error": str(e)}
+
+    return {"count": count, "sample_affected": sample_docs}
+
+
+@app.post("/mutation-commit")
+def mutation_commit(request: CommitRequest):
+    """Execute a previously previewed mutation plan against MongoDB.
+    This is the human-approval commit step."""
+    from pymongo import MongoClient
+
+    mutation = request.mutation
+    op = mutation.get("operation")
+
+    if op not in ("insert", "update", "delete"):
+        raise HTTPException(status_code=400, detail=f"Invalid operation: {op}")
+
+    client = MongoClient(request.mongo_uri, serverSelectionTimeoutMS=5000)
+    try:
+        db = client[request.database_name]
+        coll = db[request.collection_name]
+
+        # Dynamically resolve _id type in filter (string/int/ObjectId)
+        if op in ("update", "delete") and mutation.get("filter") and "_id" in mutation["filter"]:
+            mutation["filter"] = _resolve_filter_id(coll, mutation["filter"])
+
+        # Dynamically coerce _id type in insert documents to match collection
+        if op == "insert":
+            mutation = _resolve_insert_ids(coll, mutation)
+
+        result_info: Dict[str, Any] = {"operation": op, "status": "committed"}
+
+        if op == "insert":
+            doc = mutation.get("document")
+            docs = mutation.get("documents")
+            if docs and isinstance(docs, list) and len(docs) > 0:
+                insert_result = coll.insert_many(docs)
+                result_info["inserted_count"] = len(insert_result.inserted_ids)
+                result_info["inserted_ids"] = [str(oid) for oid in insert_result.inserted_ids]
+            elif doc and isinstance(doc, dict):
+                insert_result = coll.insert_one(doc)
+                result_info["inserted_count"] = 1
+                result_info["inserted_id"] = str(insert_result.inserted_id)
+            else:
+                raise HTTPException(status_code=400, detail="Insert requires 'document' or 'documents'")
+
+        elif op == "update":
+            filt = mutation.get("filter") or {}
+            update_doc = mutation.get("update")
+            if not update_doc:
+                raise HTTPException(status_code=400, detail="Update requires 'update' field")
+            # Auto-fix: if update has no $ operators, wrap in $set
+            if not any(k.startswith("$") for k in update_doc):
+                update_doc = {"$set": update_doc}
+            multi = mutation.get("multi", False)
+            if multi:
+                update_result = coll.update_many(filt, update_doc)
+            else:
+                update_result = coll.update_one(filt, update_doc)
+            result_info["matched_count"] = update_result.matched_count
+            result_info["modified_count"] = update_result.modified_count
+
+        elif op == "delete":
+            filt = mutation.get("filter") or {}
+            multi = mutation.get("multi", False)
+            if multi:
+                delete_result = coll.delete_many(filt)
+            else:
+                delete_result = coll.delete_one(filt)
+            result_info["deleted_count"] = delete_result.deleted_count
+
+        # Invalidate schema cache for this collection since data changed
+        invalidate_schema(request.mongo_uri, request.database_name, request.collection_name)
+
+        logger.info("[MUTATION] Committed %s on %s.%s: %s",
+                     op, request.database_name, request.collection_name, result_info)
+
+        # Log commit activity (fire-and-forget)
+        try:
+            log_activity(
+                request.mongo_uri, request.database_name,
+                activity_type=ACTIVITY_COMMIT,
+                collection_name=request.collection_name,
+                user_email=getattr(request, "user_email", "anonymous") or "anonymous",
+                query=mutation.get("description", op),
+                details={
+                    "operation": op,
+                    **{k: v for k, v in result_info.items() if k != "status"},
+                },
+            )
+        except Exception:
+            pass
+
+        return result_info
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("[MUTATION] Commit failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Mutation commit failed: {e}")
+    finally:
+        client.close()
+
+
+# ====================== ANALYTICS / DASHBOARD ENDPOINTS ======================
+
+
+class AnalyticsRequest(BaseModel):
+    """Request model for dashboard analytics endpoints."""
+    mongo_uri: str
+    database_name: str
+    user_email: Optional[str] = None
+    year: Optional[int] = None
+    month: Optional[int] = None
+    day: Optional[int] = None
+    days: int = Field(default=30, ge=1, le=365, description="Lookback window in days")
+    hours: Optional[int] = Field(default=None, ge=1, le=8760, description="Lookback window in hours (overrides days)")
+    minutes: Optional[int] = Field(default=None, ge=1, le=525600, description="Lookback window in minutes (overrides hours/days)")
+    granularity: str = Field(default="auto", description="Time bucket granularity: auto, minute, hour, day, month")
+
+
+def _resolve_lookback_minutes(request: AnalyticsRequest) -> Optional[int]:
+    """Convert the user's time filter (minutes/hours/days) into total minutes."""
+    if request.minutes:
+        return request.minutes
+    if request.hours:
+        return request.hours * 60
+    if request.days:
+        return request.days * 24 * 60
+    return None
+
+
+@app.post("/analytics/commit-timeline")
+def commit_timeline(request: AnalyticsRequest):
+    """Return recent commit events for the commit-tracking chart."""
+    try:
+        lookback_mins = _resolve_lookback_minutes(request)
+        data = get_commit_timeline(
+            request.mongo_uri,
+            request.database_name,
+            user_email=request.user_email,
+            lookback_minutes=lookback_mins,
+        )
+        return {"timeline": data, "count": len(data)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load commit timeline: {e}")
+
+
+@app.post("/analytics/stats")
+def activity_stats(request: AnalyticsRequest):
+    """Return aggregated activity stats (totals, daily/hourly/minute breakdown, severity, top collections)."""
+    try:
+        lookback_mins = _resolve_lookback_minutes(request)
+        data = get_activity_stats(
+            request.mongo_uri,
+            request.database_name,
+            user_email=request.user_email,
+            year=request.year,
+            month=request.month,
+            day=request.day,
+            lookback_minutes=lookback_mins,
+            granularity=request.granularity,
+        )
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load stats: {e}")
+
+
+@app.post("/analytics/diagnosis-monthly")
+def diagnosis_monthly(request: AnalyticsRequest):
+    """Return diagnosis events aggregated by month/day/hour with severity scores."""
+    try:
+        data = get_diagnosis_monthly(
+            request.mongo_uri,
+            request.database_name,
+            user_email=request.user_email,
+            year=request.year,
+            month=request.month,
+            day=request.day,
+            granularity=request.granularity,
+        )
+        return {"monthly": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load diagnosis data: {e}")
 
 
 @app.get("/health")
@@ -642,28 +1603,47 @@ def health_check():
 def llm_status():
     """Check whether the LLM parser is configured and available."""
     import os
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    has_key = bool(api_key)
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    from llm_parser import _get_llm_provider
+
+    provider = _get_llm_provider()
     mode = PARSER_MODE
 
-    sdk_available = False
-    try:
-        from google import genai  # noqa: F401
-        sdk_available = True
-    except ImportError:
-        pass
+    if provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        has_key = bool(api_key)
+        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        sdk_available = False
+        try:
+            import groq  # noqa: F401
+            sdk_available = True
+        except ImportError:
+            pass
+        sdk_name = "groq"
+    else:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        has_key = bool(api_key)
+        model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        sdk_available = False
+        try:
+            from google import genai  # noqa: F401
+            sdk_available = True
+        except ImportError:
+            pass
+        sdk_name = "google-genai"
 
     return {
         "llm_configured": has_key and sdk_available,
         "api_key_set": has_key,
         "sdk_installed": sdk_available,
+        "provider": provider,
         "model": model,
         "parser_mode": mode,
         "info": (
-            "LLM parser active — queries parsed via AI with rule-based fallback"
+            f"LLM parser active ({provider}/{model}) — queries parsed via AI "
+            "with rule-based fallback"
             if has_key and sdk_available
-            else "LLM parser inactive — using rule-based parser only. "
-                 "Set GEMINI_API_KEY env var and install google-generativeai."
+            else f"LLM parser inactive — using rule-based parser only. "
+                 f"Set {'GROQ_API_KEY' if provider == 'groq' else 'GEMINI_API_KEY'} "
+                 f"env var and install {sdk_name}."
         ),
     }

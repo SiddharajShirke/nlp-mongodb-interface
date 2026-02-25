@@ -49,11 +49,15 @@ def paraphrase_ir(ir: Dict[str, Any]) -> str:
 
 
 def clean_documents(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove ``_id`` and sanitise non-JSON-serialisable values (bytes,
-    datetime, ObjectId, etc.) so FastAPI can encode the response."""
+    """Stringify ``_id`` and sanitise non-JSON-serialisable values (bytes,
+    datetime, ObjectId, Decimal128, etc.) so FastAPI can encode the response.
+
+    ``_id`` is kept so users can see and reference document identifiers in
+    subsequent queries and mutation operations."""
     cleaned = []
     for doc in results:
-        doc.pop("_id", None)
+        if "_id" in doc:
+            doc["_id"] = str(doc["_id"])
         cleaned.append(_sanitise_value(doc))
     return cleaned
 
