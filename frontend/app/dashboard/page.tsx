@@ -13,70 +13,70 @@ import { DiagnosisAnalyticsChart } from "@/components/dashboard/diagnosis-analyt
 import { Loader2, LayoutDashboard } from "lucide-react"
 
 export default function DashboardPage() {
-  const router = useRouter()
-  const { isAuthenticated, isLoading: authLoading } = useAuth()
-  const { isConnected, selectedDB } = useAppContext()
+    const router = useRouter()
+    const { isAuthenticated, isLoading: authLoading } = useAuth()
+    const { isConnected, selectedDB } = useAppContext()
 
-  // Redirect if not authenticated or not connected
-  useEffect(() => {
-    if (!authLoading && !isAuthenticated) {
-      router.replace("/")
-    } else if (!authLoading && isAuthenticated && !isConnected) {
-      router.replace("/connector")
+    // Redirect if not authenticated or not connected
+    useEffect(() => {
+        if (!authLoading && !isAuthenticated) {
+            router.replace("/")
+        } else if (!authLoading && isAuthenticated && !isConnected) {
+            router.replace("/connector")
+        }
+    }, [authLoading, isAuthenticated, isConnected, router])
+
+    if (authLoading) {
+        return (
+            <div className="flex min-h-screen flex-col">
+                <Navbar />
+                <main className="flex flex-1 items-center justify-center">
+                    <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+                </main>
+            </div>
+        )
     }
-  }, [authLoading, isAuthenticated, isConnected, router])
 
-  if (authLoading) {
+    if (!isAuthenticated || !isConnected) {
+        return null // Will redirect
+    }
+
     return (
-      <div className="flex min-h-screen flex-col">
-        <Navbar />
-        <main className="flex flex-1 items-center justify-center">
-          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-        </main>
-      </div>
-    )
-  }
+        <div className="flex min-h-screen flex-col">
+            <Navbar />
+            <main className="flex-1 overflow-y-auto">
+                <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+                    {/* Header */}
+                    <div className="mb-6 flex items-center gap-3">
+                        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary">
+                            <LayoutDashboard className="h-5 w-5 text-primary-foreground" />
+                        </div>
+                        <div>
+                            <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
+                            <p className="text-sm text-muted-foreground">
+                                Analytics &amp; activity tracking for{" "}
+                                <span className="font-medium text-foreground">{selectedDB ?? "your database"}</span>
+                            </p>
+                        </div>
+                    </div>
 
-  if (!isAuthenticated || !isConnected) {
-    return null // Will redirect
-  }
+                    {/* Dashboard Grid */}
+                    <div className="grid gap-6">
+                        {/* Row 1: User Credentials (full width) */}
+                        <UserCredentialsCard />
 
-  return (
-    <div className="flex min-h-screen flex-col">
-      <Navbar />
-      <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-          {/* Header */}
-          <div className="mb-6 flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary">
-              <LayoutDashboard className="h-5 w-5 text-primary-foreground" />
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
-              <p className="text-sm text-muted-foreground">
-                Analytics &amp; activity tracking for{" "}
-                <span className="font-medium text-foreground">{selectedDB ?? "your database"}</span>
-              </p>
-            </div>
-          </div>
+                        {/* Row 2: Activity Overview + Commit Tracking side by side */}
+                        <div className="grid gap-6 lg:grid-cols-2">
+                            <ActivityOverviewChart />
+                            <CommitTrackingChart />
+                        </div>
 
-          {/* Dashboard Grid */}
-          <div className="grid gap-6">
-            {/* Row 1: User Credentials (full width) */}
-            <UserCredentialsCard />
-
-            {/* Row 2: Activity Overview + Commit Tracking side by side */}
-            <div className="grid gap-6 lg:grid-cols-2">
-              <ActivityOverviewChart />
-              <CommitTrackingChart />
-            </div>
-
-            {/* Row 3: Diagnosis Analytics (full width) */}
-            <DiagnosisAnalyticsChart />
-          </div>
+                        {/* Row 3: Diagnosis Analytics (full width) */}
+                        <DiagnosisAnalyticsChart />
+                    </div>
+                </div>
+            </main>
+            <Footer />
         </div>
-      </main>
-      <Footer />
-    </div>
-  )
+    )
 }

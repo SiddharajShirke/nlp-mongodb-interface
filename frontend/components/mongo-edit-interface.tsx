@@ -95,7 +95,7 @@ export function MongoEditInterface({
     collection: string
 }) {
     const { connectionString } = useAppContext()
-  const { user } = useAuth()
+    const { user } = useAuth()
 
     // ---- Mode toggle ----
     const [mode, setMode] = useState<EditMode | null>(null)
@@ -261,8 +261,8 @@ export function MongoEditInterface({
                 <button
                     onClick={() => setMode("manual")}
                     className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${mode === "manual"
-                            ? "bg-primary text-primary-foreground"
-                            : "text-muted-foreground hover:text-foreground"
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:text-foreground"
                         }`}
                 >
                     <Table2 className="h-3.5 w-3.5" />
@@ -271,8 +271,8 @@ export function MongoEditInterface({
                 <button
                     onClick={() => setMode("query")}
                     className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${mode === "query"
-                            ? "bg-primary text-primary-foreground"
-                            : "text-muted-foreground hover:text-foreground"
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:text-foreground"
                         }`}
                 >
                     <MessageSquareText className="h-3.5 w-3.5" />
@@ -562,8 +562,8 @@ function ManualInputPanel({
                             resetForm()
                         }}
                         className={`inline-flex items-center gap-1 rounded-lg px-3 py-1 text-xs font-medium capitalize transition-colors ${manualOp === op
-                                ? `border ${opColor(op)}`
-                                : "text-muted-foreground hover:text-foreground"
+                            ? `border ${opColor(op)}`
+                            : "text-muted-foreground hover:text-foreground"
                             }`}
                     >
                         {opIcon(op)} {op}
@@ -845,8 +845,8 @@ function MutationCard({
             <div className="flex items-start gap-3 border-b border-border px-4 py-3">
                 <span
                     className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${source === "manual"
-                            ? "bg-blue-500/10 text-blue-600 dark:text-blue-400"
-                            : "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                        ? "bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                        : "bg-amber-500/10 text-amber-600 dark:text-amber-400"
                         }`}
                 >
                     {source}
