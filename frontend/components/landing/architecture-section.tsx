@@ -2,24 +2,28 @@ import { ArrowRight } from "lucide-react"
 
 const steps = [
   {
-    label: "Frontend",
-    tech: "React + Next.js",
-    description: "User types a natural language query in the chat interface",
+    label: "Access",
+    tech: "NextAuth + Connector",
+    description:
+      "Login with Google, connect MongoDB URI, pick database and collection",
   },
   {
-    label: "API Gateway",
-    tech: "Node.js Express",
-    description: "Request is validated and routed to the NLP service",
+    label: "Query",
+    tech: "Chat + Diagnose",
+    description:
+      "Ask in plain English, view tabular results, and inspect full pipeline trace",
   },
   {
-    label: "NLP Service",
-    tech: "FastAPI",
-    description: "Natural language is translated into a MongoDB query",
+    label: "Edit",
+    tech: "Preview -> Add -> Commit",
+    description:
+      "Generate CRUD mutation plans (manual or NL), estimate impact, then commit",
   },
   {
-    label: "Database",
-    tech: "MongoDB",
-    description: "Query is executed and results are returned upstream",
+    label: "Observe",
+    tech: "Dashboard Analytics",
+    description:
+      "Monitor commits, activity breakdown, diagnosis severity, and health scores",
   },
 ]
 
@@ -36,10 +40,10 @@ export function ArchitectureSection() {
       <div className="mx-auto max-w-4xl">
         <div className="mb-12 text-center">
           <h2 className="text-2xl font-bold tracking-tight text-foreground md:text-3xl">
-            How it works
+            Product workflow
           </h2>
           <p className="mt-3 text-sm text-muted-foreground">
-            A clean pipeline from natural language to query results.
+            The same path your team follows: connect, query, safely edit, then track.
           </p>
         </div>
 

@@ -21,21 +21,21 @@ export function HeroSection() {
         <div className="mb-8 inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-1.5">
           <Terminal className="h-3.5 w-3.5 text-primary" />
           <span className="text-xs font-medium text-muted-foreground">
-            Developer-First MongoDB Tool
+            Google Auth + MongoDB NLP Workspace
           </span>
         </div>
 
         {/* Heading */}
         <h1 className="text-balance text-4xl font-bold leading-tight tracking-tight text-foreground md:text-5xl lg:text-6xl">
-          Natural Language Interface{" "}
-          <span className="text-primary">for MongoDB</span>
+          Query, Diagnose, and Edit{" "}
+          <span className="text-primary">MongoDB in Plain English</span>
         </h1>
 
         {/* Description */}
         <p className="mx-auto mt-6 max-w-xl text-pretty text-base leading-relaxed text-muted-foreground md:text-lg">
-          Stop writing complex aggregation pipelines by hand. Query your MongoDB
-          databases using plain English and let the NLP engine handle the
-          translation.
+          Connect your cluster, select a database and collection, then run
+          natural-language queries, inspect full pipeline diagnostics, and apply
+          safe preview-first mutations from one interface.
         </p>
 
         {/* CTA */}
@@ -45,7 +45,7 @@ export function HeroSection() {
               href="/connector"
               className="inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
             >
-              Go to Dashboard
+              Open Connector
               <ArrowRight className="h-4 w-4" />
             </Link>
           ) : (
@@ -55,7 +55,7 @@ export function HeroSection() {
                 disabled={authActionLoading}
                 className="inline-flex items-center gap-2 rounded-xl bg-primary px-6 py-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {authActionLoading ? "Connecting..." : "Get Started"}
+                {authActionLoading ? "Connecting..." : "Login with Google"}
                 <ArrowRight className="h-4 w-4" />
               </button>
               {authError && (
@@ -85,18 +85,21 @@ export function HeroSection() {
             <p className="font-mono text-xs leading-relaxed text-muted-foreground">
               <span className="text-primary">{">"}</span>{" "}
               <span className="text-foreground">
-                Show me all users who signed up in the last 7 days
+                show orders with status pending from last 7 days
               </span>
             </p>
             <p className="mt-3 font-mono text-xs leading-relaxed text-muted-foreground">
               <span className="text-primary/70">{"// "}</span>
-              {"Translating to MongoDB query..."}
+              {"Diagnose: parse -> validate -> compile -> execute preview"}
             </p>
             <p className="mt-1 font-mono text-xs leading-relaxed text-foreground/80">
-              {'db.users.find({ createdAt: { $gte: ISODate("2025-02-16") } })'}
+              {'db.orders.find({ status: "pending", createdAt: { $gte: ... } })'}
+            </p>
+            <p className="mt-1 font-mono text-xs leading-relaxed text-foreground/80">
+              {"mutation preview: update status -> processing (estimated 42 docs)"}
             </p>
             <p className="mt-3 font-mono text-xs text-primary">
-              {"Found 23 documents"}
+              {"add -> commit -> tracked in dashboard timeline"}
             </p>
           </div>
         </div>

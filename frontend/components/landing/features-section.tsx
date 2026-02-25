@@ -1,29 +1,48 @@
-import { Database, MessageSquare, Shield, Zap } from "lucide-react"
+import {
+  Activity,
+  Database,
+  MessageSquare,
+  ShieldCheck,
+  Stethoscope,
+  WandSparkles,
+} from "lucide-react"
 
 const features = [
   {
-    icon: MessageSquare,
-    title: "Natural Language Queries",
-    description:
-      "Write queries in plain English. The NLP engine translates your intent into optimized MongoDB operations, including aggregations and lookups.",
-  },
-  {
     icon: Database,
-    title: "Multi-Database Support",
+    title: "Authenticated Cluster Connector",
     description:
-      "Connect to any MongoDB instance. Browse databases and collections with a clean, intuitive interface designed for developers.",
+      "Sign in with Google, connect with your MongoDB URI, and browse databases and collections before jumping into query or edit mode.",
   },
   {
-    icon: Zap,
-    title: "Real-Time Results",
+    icon: MessageSquare,
+    title: "Session-Based Query Chat",
     description:
-      "Get instant responses in a chat-like interface. Results are formatted for readability with syntax highlighting for JSON output.",
+      "Run natural-language queries with multi-chat history per collection, searchable sessions, tabular result rendering, pagination metadata, and value hints.",
   },
   {
-    icon: Shield,
-    title: "Secure Connections",
+    icon: Stethoscope,
+    title: "Deep Pipeline Diagnostics",
     description:
-      "Your connection strings are never stored. All communication happens through the API gateway with encrypted transport.",
+      "Inspect every diagnosis stage: raw sample, schema detection, NL parse, field resolution, validation, MongoDB compilation, execution preview, and index analysis.",
+  },
+  {
+    icon: WandSparkles,
+    title: "Mongo Edit with Approval Workflow",
+    description:
+      "Use Manual Change or Query Dynamic Change, preview mutations, estimate affected documents, then explicitly Add and Commit changes to MongoDB.",
+  },
+  {
+    icon: ShieldCheck,
+    title: "Safety + Performance Signals",
+    description:
+      "Get non-blocking warnings for unindexed queried fields, zero-result value hints, schema cache controls, and parser fallback support.",
+  },
+  {
+    icon: Activity,
+    title: "Operational Analytics Dashboard",
+    description:
+      "Track query, diagnose, and commit activity with time filters, commit timeline, diagnosis severity trends, health scores, and top collections.",
   },
 ]
 
@@ -36,10 +55,10 @@ export function FeaturesSection() {
       <div className="mx-auto max-w-5xl">
         <div className="mb-12 text-center">
           <h2 className="text-2xl font-bold tracking-tight text-foreground md:text-3xl">
-            Built for developers who work with MongoDB
+            Built for day-to-day MongoDB operations
           </h2>
           <p className="mt-3 text-sm text-muted-foreground">
-            A streamlined workflow from connection to query result.
+            From connection and investigation to controlled writes and analytics.
           </p>
         </div>
 
